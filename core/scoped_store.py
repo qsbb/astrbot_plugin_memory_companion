@@ -154,6 +154,13 @@ class ScopedStore:
             finally:
                 conn.close()
 
+    def initialize(self) -> None:
+        with self._lock:
+            if self._initialized:
+                return
+            self._initialize()
+            self._initialized = True
+
     def _initialize(self) -> None:
         with self._connection() as conn:
             conn.executescript(

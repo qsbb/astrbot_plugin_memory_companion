@@ -42,13 +42,25 @@ from .models import (
 )
 from .assertions import ASSERTION_MEMORY_TYPE
 from .models import memory_embedding_text_hash
+from .memory_revision import (
+    MemoryRevisionError, correction_owner, correction_scope, current_memory, digest, memory_ref, revised_memory,
+)
 from .portrait import cross_scene_whitelisted_fact
 from .profile_quality import normalize_profile_value, profile_quality_decision
 from .portrait_namespace import portrait_scope_kind, portrait_scope_persona
 from .sensitive_data import redact_sensitive_text, redact_sensitive_value
+from .source_query import SourceQuery, SourceQueryError, source_partition
 
 
 _ACL_UNSET = object()
+
+
+def _timeline_time_sql(alias: str = "") -> str:
+    prefix = f"{alias}." if alias else ""
+    return (
+        f"COALESCE(julianday(NULLIF({prefix}occurred_at, '')), "
+        f"julianday(NULLIF({prefix}created_at, '')), 0)"
+    )
 
 
 def _memory_time_sql(
@@ -64,6 +76,22 @@ def _memory_time_sql(
     columns.append("created_at")
     values = [f"julianday(NULLIF({prefix}{column}, ''))" for column in columns]
     return f"COALESCE({', '.join(values)}, 0)"
+
+
+def _timeline_order_key(row: dict[str, Any]) -> tuple[float, str, str]:
+    for value in (row.get("occurred_at"), row.get("created_at")):
+        text = clean_text(value, 80)
+        if not text:
+            continue
+        try:
+            moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            timestamp = moment.astimezone(timezone.utc).timestamp()
+            return timestamp, clean_text(row.get("created_at"), 80), clean_text(row.get("id"), 160)
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return float("-inf"), clean_text(row.get("created_at"), 80), clean_text(row.get("id"), 160)
 
 
 class SharedTextCache:
@@ -135,10 +163,10 @@ def _unpack_embedding_vector(raw: Any) -> list[float]:
 
 def _normalize_embedding_vector_values(values: list[float]) -> list[float]:
     """对向量做 L2 归一化，供候选缓存一次性归一化，避免每次召回重复计算。"""
-    if not values:
+    if not values or not all(math.isfinite(value) for value in values):
         return []
-    norm = math.sqrt(sum(value * value for value in values))
-    if norm <= 0:
+    norm = math.hypot(*values)
+    if not math.isfinite(norm) or norm <= 0:
         return []
     return [value / norm for value in values]
 
@@ -148,6 +176,9 @@ from .summary_batches import SummaryBatchStore
 
 class MemoryStore(SummaryBatchStore):
     EMBEDDING_CANDIDATE_CACHE_MAX = 64
+    MAINTENANCE_REPAIR_BATCH_SIZE = 200
+    MAINTENANCE_FINGERPRINT_REPAIR_VERSION = "v1"
+    MEMORY_ATOM_BACKFILL_VERSION = "v1"
     SCHEMA_VERSION = "memory-atom-v2"
     # Redaction is idempotent but scanning the whole history at every startup
     # is needlessly expensive for large installations.  Bump this when the
@@ -234,12 +265,15 @@ class MemoryStore(SummaryBatchStore):
         self._closed = False
         self._fts_enabled = False
         self._knowledge_trgm_enabled = False
+        self._source_fts_enabled = False
         self._savepoint_counter = 0
         self._embedding_candidate_cache_revision = ""
         self._embedding_candidate_cache: dict[
             tuple[str, bool, int],
             list[tuple[MemoryRecord, list[float], str]],
         ] = {}
+        self._vector_search_lock = threading.RLock()
+        self._vector_search_cache: dict[tuple, Any] = {}
         self._acl_feature_override_cache: dict[
             tuple[str, str], tuple[bool | None, bool | None]
         ] = {}
@@ -727,6 +761,9 @@ class MemoryStore(SummaryBatchStore):
                         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_fts'"
                     ).fetchone()
                 )
+                self._source_fts_enabled = bool(self._conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='timeline_source_fts'"
+                ).fetchone())
             return
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
@@ -1229,6 +1266,20 @@ class MemoryStore(SummaryBatchStore):
             self._ensure_knowledge_trgm_sync()
             self._remove_legacy_redaction_tracking_triggers_sync()
             self._ensure_retrieval_revision_sync()
+            self._ensure_source_query_indexes_sync()
+            from .source_watches import initialize as initialize_life_source_watches
+            initialize_life_source_watches(self._conn)
+            from .source_capture import initialize as initialize_capture
+            initialize_capture(self._conn)
+            from .source_semantic import initialize as initialize_source_semantic
+            initialize_source_semantic(self._conn)
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS memory_correction_receipts (
+                    scope_ref TEXT NOT NULL, correction_id TEXT NOT NULL,
+                    request_hash TEXT NOT NULL, receipt TEXT NOT NULL,
+                    PRIMARY KEY(scope_ref, correction_id)
+                )
+            """)
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memories_fingerprint ON memories(content_fingerprint)"
             )
@@ -1360,6 +1411,11 @@ class MemoryStore(SummaryBatchStore):
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_timeline_session_recent "
                 "ON timeline(session_id, occurred_at DESC, created_at DESC)"
+            )
+            event_time_sql = _timeline_time_sql()
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_timeline_session_event_time "
+                f"ON timeline(session_id, scope, {event_time_sql}, created_at, id)"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at)"
@@ -1559,50 +1615,20 @@ class MemoryStore(SummaryBatchStore):
             (self.SENSITIVE_REDACTION_VERSION, utc_now()),
         )
 
-    def _ensure_redaction_tracking_triggers_sync(self) -> None:
-        """Invalidate the startup redaction marker when protected text changes."""
+    def _remove_legacy_redaction_tracking_triggers_sync(self) -> None:
+        """Remove legacy triggers that made every safe write rescan the full store.
+
+        Store write APIs redact text and metadata before persistence. The old
+        triggers could not distinguish those safe writes from legacy data, so
+        one new chat message invalidated the marker and forced an O(N) scan on
+        the next startup.
+        """
         self._conn.executescript(
             """
-            CREATE TRIGGER IF NOT EXISTS trg_redaction_memories_insert
-            AFTER INSERT ON memories
-            WHEN EXISTS (
-                SELECT 1 FROM schema_metadata
-                WHERE key='sensitive_redaction_version' AND value <> ''
-            )
-            BEGIN
-                UPDATE schema_metadata SET value='', updated_at=datetime('now')
-                WHERE key='sensitive_redaction_version';
-            END;
-            CREATE TRIGGER IF NOT EXISTS trg_redaction_memories_update
-            AFTER UPDATE OF content,evidence,metadata ON memories
-            WHEN EXISTS (
-                SELECT 1 FROM schema_metadata
-                WHERE key='sensitive_redaction_version' AND value <> ''
-            )
-            BEGIN
-                UPDATE schema_metadata SET value='', updated_at=datetime('now')
-                WHERE key='sensitive_redaction_version';
-            END;
-            CREATE TRIGGER IF NOT EXISTS trg_redaction_timeline_insert
-            AFTER INSERT ON timeline
-            WHEN EXISTS (
-                SELECT 1 FROM schema_metadata
-                WHERE key='sensitive_redaction_version' AND value <> ''
-            )
-            BEGIN
-                UPDATE schema_metadata SET value='', updated_at=datetime('now')
-                WHERE key='sensitive_redaction_version';
-            END;
-            CREATE TRIGGER IF NOT EXISTS trg_redaction_timeline_update
-            AFTER UPDATE OF content,metadata ON timeline
-            WHEN EXISTS (
-                SELECT 1 FROM schema_metadata
-                WHERE key='sensitive_redaction_version' AND value <> ''
-            )
-            BEGIN
-                UPDATE schema_metadata SET value='', updated_at=datetime('now')
-                WHERE key='sensitive_redaction_version';
-            END;
+            DROP TRIGGER IF EXISTS trg_redaction_memories_insert;
+            DROP TRIGGER IF EXISTS trg_redaction_memories_update;
+            DROP TRIGGER IF EXISTS trg_redaction_timeline_insert;
+            DROP TRIGGER IF EXISTS trg_redaction_timeline_update;
             """
         )
 
@@ -1799,6 +1825,59 @@ class MemoryStore(SummaryBatchStore):
             END;
             """
         )
+
+    def _ensure_source_query_indexes_sync(self) -> None:
+        """Incremental, rebuildable raw-message index and cursor revision."""
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS source_query_revision (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1), revision INTEGER NOT NULL
+            );
+            INSERT OR IGNORE INTO source_query_revision VALUES(1,0);
+            CREATE TRIGGER IF NOT EXISTS trg_source_query_revision_ai AFTER INSERT ON timeline
+            BEGIN UPDATE source_query_revision SET revision=revision+1 WHERE singleton=1; END;
+            CREATE TRIGGER IF NOT EXISTS trg_source_query_revision_ad AFTER DELETE ON timeline
+            BEGIN UPDATE source_query_revision SET revision=revision+1 WHERE singleton=1; END;
+            CREATE TRIGGER IF NOT EXISTS trg_source_query_revision_au
+            AFTER UPDATE OF id,scope,session_id,subject_id,object_id,event_type,content,metadata,occurred_at,created_at ON timeline
+            BEGIN UPDATE source_query_revision SET revision=revision+1 WHERE singleton=1; END;
+            CREATE INDEX IF NOT EXISTS idx_timeline_source_page
+            ON timeline(scope,session_id,julianday(occurred_at) DESC,created_at DESC,id DESC);
+        """)
+        initialized = self._conn.execute(
+            "SELECT value FROM schema_metadata WHERE key='timeline_source_fts_version'"
+        ).fetchone()
+        index_exists = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='timeline_source_fts'"
+        ).fetchone() is not None
+        try:
+            self._conn.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS timeline_source_fts
+                USING fts5(content, content='timeline', content_rowid='rowid', tokenize='trigram')
+            """)
+            self._conn.executescript("""
+                CREATE TRIGGER IF NOT EXISTS trg_timeline_source_fts_ai AFTER INSERT ON timeline
+                BEGIN INSERT INTO timeline_source_fts(rowid,content) VALUES(new.rowid,new.content); END;
+                CREATE TRIGGER IF NOT EXISTS trg_timeline_source_fts_ad AFTER DELETE ON timeline
+                BEGIN INSERT INTO timeline_source_fts(timeline_source_fts,rowid,content)
+                    VALUES('delete',old.rowid,old.content); END;
+                CREATE TRIGGER IF NOT EXISTS trg_timeline_source_fts_au AFTER UPDATE OF content ON timeline
+                BEGIN
+                    INSERT INTO timeline_source_fts(timeline_source_fts,rowid,content)
+                        VALUES('delete',old.rowid,old.content);
+                    INSERT INTO timeline_source_fts(rowid,content) VALUES(new.rowid,new.content);
+                END;
+            """)
+            if not index_exists or initialized is None or initialized[0] != "trigram-v1":
+                self._conn.execute("INSERT INTO timeline_source_fts(timeline_source_fts) VALUES('rebuild')")
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO schema_metadata(key,value,updated_at) VALUES('timeline_source_fts_version','trigram-v1',?)",
+                    (utc_now(),),
+                )
+            self._source_fts_enabled = True
+        except sqlite3.OperationalError as exc:
+            if "no such tokenizer" not in str(exc) and "no such module" not in str(exc):
+                raise
+            self._source_fts_enabled = False
 
     def _ensure_memory_fts_sync(self) -> None:
         try:
@@ -3186,6 +3265,7 @@ class MemoryStore(SummaryBatchStore):
             self._conn.commit()
             self._conn.close()
             self._closed = True
+            self._vector_search_cache.clear()
         with self._read_lock:
             if self._read_conn is not None:
                 try:
@@ -3364,15 +3444,30 @@ class MemoryStore(SummaryBatchStore):
                     memory_params,
                 ).fetchall()
             ]
+            timeline_ids = [
+                row["id"]
+                for row in self._conn.execute(
+                    f"SELECT id FROM timeline WHERE {timeline_where}", timeline_params
+                ).fetchall()
+            ]
+            linked_memory_ids = [
+                memory_id
+                for memory_id, _metadata in self._timeline_reference_memories_sync(set(timeline_ids))
+            ]
+            all_memory_ids = list(dict.fromkeys([*memory_ids, *linked_memory_ids]))
             counts = {
-                "memories": len(memory_ids),
-                "timeline": self._count_where("timeline", timeline_where, timeline_params),
-                "relationship_edges": self._count_where("relationship_edges", relation_where, relation_params),
+                "memories": len(all_memory_ids),
+                "timeline": len(timeline_ids),
+                "relationship_edges": self._count_relationship_edges_for_scope_or_memory_ids(
+                    relation_where,
+                    relation_params,
+                    all_memory_ids,
+                ),
                 "knowledge_nodes": self._count_where("knowledge_nodes", knowledge_node_where, knowledge_node_params),
                 "knowledge_edges": self._count_knowledge_edges_for_scope_or_memory_ids(
                     knowledge_edge_where,
                     knowledge_edge_params,
-                    memory_ids,
+                    all_memory_ids,
                 ),
                 "injection_logs": self._count_where("injection_logs", injection_where, injection_params),
                 "summary_failures": self._count_where("summary_failures", injection_where, injection_params),
@@ -3391,14 +3486,15 @@ class MemoryStore(SummaryBatchStore):
             backup = self.backup(f".before_clear_{target_type}")
             deleted: dict[str, int] = {}
             with self._transaction_sync():
-                if memory_ids:
-                    self._delete_many_by_ids("review_queue", "memory_id", memory_ids, deleted)
-                    self._delete_many_by_ids("memory_embeddings", "memory_id", memory_ids, deleted)
-                    self._delete_many_by_ids("knowledge_edges", "source_memory_id", memory_ids, deleted)
-                    self._delete_many_by_ids("relationship_edges", "source_memory_id", memory_ids, deleted)
-                    for memory_id in memory_ids:
+                if all_memory_ids:
+                    self._delete_many_by_ids("review_queue", "memory_id", all_memory_ids, deleted)
+                    self._delete_many_by_ids("memory_embeddings", "memory_id", all_memory_ids, deleted)
+                    self._delete_many_by_ids("knowledge_edges", "source_memory_id", all_memory_ids, deleted)
+                    self._delete_many_by_ids("relationship_edges", "source_memory_id", all_memory_ids, deleted)
+                    for memory_id in all_memory_ids:
                         self._delete_memory_fts_row(memory_id)
                 deleted["memories"] = self._delete_where("memories", memory_where, memory_params)
+                deleted["memories"] += self._delete_memories_referencing_timeline_ids_sync(timeline_ids)
                 deleted["timeline"] = self._delete_where("timeline", timeline_where, timeline_params)
                 deleted["relationship_edges"] = deleted.get("relationship_edges", 0) + self._delete_where(
                     "relationship_edges", relation_where, relation_params
@@ -3474,6 +3570,28 @@ class MemoryStore(SummaryBatchStore):
             placeholders = ",".join("?" for _ in chunk)
             rows = self._conn.execute(
                 f"SELECT id FROM knowledge_edges WHERE source_memory_id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            edge_ids.update(row["id"] for row in rows)
+        return len(edge_ids)
+
+    def _count_relationship_edges_for_scope_or_memory_ids(
+        self,
+        where: str,
+        params: list[Any],
+        memory_ids: list[str],
+    ) -> int:
+        edge_ids = {
+            row["id"]
+            for row in self._conn.execute(
+                f"SELECT id FROM relationship_edges WHERE {where}", params
+            ).fetchall()
+        }
+        for index in range(0, len(memory_ids), 500):
+            chunk = memory_ids[index:index + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._conn.execute(
+                f"SELECT id FROM relationship_edges WHERE source_memory_id IN ({placeholders})",
                 chunk,
             ).fetchall()
             edge_ids.update(row["id"] for row in rows)
@@ -5948,6 +6066,35 @@ class MemoryStore(SummaryBatchStore):
             review_reason,
         )
 
+    async def upsert_bot_personal_archive(self, record: MemoryRecord) -> dict[str, Any]:
+        """Commit the archive version check and row update in one transaction."""
+        return await self._run_recoverable_database_operation(self._upsert_bot_personal_archive_sync, record)
+
+    def _upsert_bot_personal_archive_sync(self, record: MemoryRecord) -> dict[str, Any]:
+        metadata = record.metadata if isinstance(record.metadata, dict) else {}
+        version = metadata.get("version")
+        fingerprint = metadata.get("payload_fingerprint")
+        if metadata.get("bot_personal") is not True or type(version) is not int or version < 1 or not fingerprint:
+            raise ValueError("invalid_bot_personal_archive_record")
+        receipt = {"ok": False, "record_id": record.id, "version": version,
+                   "deduplicated": False, "error_code": None, "state": "sent"}
+        with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute("SELECT metadata FROM memories WHERE id=?", (record.id,)).fetchone()
+            if row is not None:
+                previous = json_loads(row["metadata"], {})
+                old_version = int(previous.get("version") or 0)
+                if old_version > version:
+                    return {**receipt, "version": old_version, "state": "stale_version", "error_code": "stale_version"}
+                if old_version == version:
+                    if previous.get("payload_fingerprint") == fingerprint:
+                        return {**receipt, "ok": True, "state": "deduplicated", "deduplicated": True}
+                    return {**receipt, "state": "version_conflict", "error_code": "version_conflict"}
+            stored_id = self._insert_memory_sync(record, _commit=False)
+            if stored_id != record.id:
+                raise RuntimeError("archive_identity_conflict")
+        return {**receipt, "ok": True}
+
     def _insert_memory_sync(
         self,
         record: MemoryRecord,
@@ -7088,6 +7235,11 @@ class MemoryStore(SummaryBatchStore):
         )
         with self._lock:
             with self._transaction_sync():
+                from .message_sources import suppressed
+                if suppressed(self._conn, source_id=row_id, event_type=event_type, scope=clean_text(scope, 40),
+                              session_id=session_id, subject_id=subject_id, object_id=clean_text(object_id, 120),
+                              message_id=message_id, metadata=metadata):
+                    return ""
                 cur = self._conn.execute(
                     """
                     INSERT OR IGNORE INTO timeline(
@@ -7123,6 +7275,10 @@ class MemoryStore(SummaryBatchStore):
                     ).fetchone()
                     if existing:
                         return clean_text(existing["id"], 120)
+                # A governance tombstone can suppress an insert. Never return
+                # the uncommitted random ID as a successful capture receipt.
+                if cur.rowcount == 0:
+                    return ""
         return row_id
 
     async def add_historical_timeline_events(self, rows: list[dict[str, Any]]) -> dict[str, str]:
@@ -7156,6 +7312,12 @@ class MemoryStore(SummaryBatchStore):
                     dedupe_key = stable_fingerprint("timeline", event_type, session_id, subject_id, message_id)
                     row_id = clean_text(raw.get("id"), 120) or new_id("tl")
                     metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+                    from .message_sources import suppressed
+                    if suppressed(self._conn, source_id=row_id, event_type=event_type,
+                                  scope=clean_text(raw.get("scope"), 40), session_id=session_id, subject_id=subject_id,
+                                  object_id=clean_text(raw.get("object_id"), 120), message_id=message_id,
+                                  metadata=redact_sensitive_value(metadata)):
+                        continue
                     cursor = self._conn.execute(
                         """
                         INSERT OR IGNORE INTO timeline(
@@ -8378,6 +8540,12 @@ class MemoryStore(SummaryBatchStore):
                     deleted["memories"] += int(
                         self._conn.execute("DELETE FROM memories WHERE id=?", (memory_id,)).rowcount or 0
                     )
+                timeline_rows = self._conn.execute(
+                    "SELECT id FROM timeline WHERE import_batch_id=?", (batch_id,)
+                ).fetchall()
+                deleted["memories"] += self._delete_memories_referencing_timeline_ids_sync(
+                    [row["id"] for row in timeline_rows]
+                )
                 deleted["timeline"] = int(
                     self._conn.execute("DELETE FROM timeline WHERE import_batch_id=?", (batch_id,)).rowcount or 0
                 )
@@ -8440,12 +8608,13 @@ class MemoryStore(SummaryBatchStore):
         if entity_id:
             where += " AND (subject_id=? OR object_id=?)"
             params.extend([entity_id, entity_id])
+        event_time_sql = _timeline_time_sql()
         with self._lock:
             rows = self._conn.execute(
                 f"""
                 SELECT * FROM timeline
                 WHERE {where}
-                ORDER BY occurred_at DESC, created_at DESC
+                ORDER BY {event_time_sql} DESC, created_at DESC, id DESC
                 LIMIT ? OFFSET ?
                 """,
                 params + [safe_limit, safe_offset],
@@ -8469,13 +8638,14 @@ class MemoryStore(SummaryBatchStore):
         """
         branch_size = limit + offset
         merged: dict[str, dict[str, Any]] = {}
+        event_time_sql = _timeline_time_sql()
         with self._lock:
             for column in ("subject_id", "object_id"):
                 rows = self._conn.execute(
                     f"""
                     SELECT * FROM timeline
                     WHERE scope=? AND session_id=? AND {column}=?
-                    ORDER BY occurred_at DESC, created_at DESC
+                    ORDER BY {event_time_sql} DESC, created_at DESC, id DESC
                     LIMIT ?
                     """,
                     (scope, session_id, entity_id, branch_size),
@@ -8484,7 +8654,7 @@ class MemoryStore(SummaryBatchStore):
                     merged.setdefault(str(row["id"]), dict(row))
         ordered = sorted(
             merged.values(),
-            key=lambda row: (str(row.get("occurred_at") or ""), str(row.get("created_at") or "")),
+            key=_timeline_order_key,
             reverse=True,
         )
         return ordered[offset : offset + limit]
@@ -8517,15 +8687,16 @@ class MemoryStore(SummaryBatchStore):
         cutoff = clean_text(since_at, 80)
         if scope not in {"private", "group"} or not session_id or not cutoff:
             return []
+        event_time_sql = _timeline_time_sql()
         with self._lock:
             rows = self._conn.execute(
-                """
+                f"""
                 SELECT * FROM timeline
                 WHERE scope=?
                   AND session_id!=?
-                  AND occurred_at>=?
+                  AND {event_time_sql} >= julianday(?)
                   AND event_type IN ('user_message', 'bot_response')
-                ORDER BY occurred_at DESC, created_at DESC
+                ORDER BY {event_time_sql} DESC, created_at DESC, id DESC
                 LIMIT ?
                 """,
                 (scope, session_id, cutoff, max(1, min(240, int(limit or 48)))),
@@ -8562,7 +8733,8 @@ class MemoryStore(SummaryBatchStore):
         entity_id: str,
     ) -> list[dict[str, Any]]:
         params: list[Any] = [clean_text(start_at, 80), clean_text(end_at, 80)]
-        where = "occurred_at >= ? AND occurred_at < ?"
+        event_time_sql = _timeline_time_sql()
+        where = f"{event_time_sql} >= julianday(?) AND {event_time_sql} < julianday(?)"
         if scope:
             where += " AND scope=?"
             params.append(clean_text(scope, 40))
@@ -8578,12 +8750,209 @@ class MemoryStore(SummaryBatchStore):
                 SELECT *
                 FROM timeline
                 WHERE {where}
-                ORDER BY occurred_at DESC, created_at DESC
+                ORDER BY {event_time_sql} DESC, created_at DESC, id DESC
                 LIMIT ?
                 """,
                 params + [max(1, int(limit or 1))],
             ).fetchall()
         return [dict(row) for row in rows]
+
+    async def source_revision(self) -> str:
+        return await self._run_recoverable_database_operation(self._source_revision_sync)
+
+    async def query_progress_revisions(self) -> tuple[str, str]:
+        """One bounded metadata read for progress authorization/version checks."""
+        return await self._run_recoverable_database_operation(self._query_progress_revisions_sync)
+
+    def _query_progress_revisions_sync(self) -> tuple[str, str]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT s.revision, m.revision FROM source_query_revision s "
+                "CROSS JOIN retrieval_revision m WHERE s.singleton=1 AND m.singleton=1"
+            ).fetchone()
+        if row is None:
+            raise SourceQueryError("source_index_unavailable")
+        return str(row[0]), str(row[1])
+
+    def _source_revision_sync(self) -> str:
+        with self._lock:
+            row = self._conn.execute("SELECT revision FROM source_query_revision WHERE singleton=1").fetchone()
+            if row is None:
+                raise SourceQueryError("source_index_unavailable")
+            return str(row[0])
+
+    async def query_source_page(
+        self, ctx: Any, query: SourceQuery, *, limit: int,
+        boundary: list[Any] | None = None, expected_revision: str | None = None,
+    ) -> dict[str, Any]:
+        return await self._run_recoverable_database_operation(
+            self._query_source_page_sync, ctx, query, limit, boundary, expected_revision,
+        )
+
+    def _query_source_page_sync(
+        self, ctx: Any, query: SourceQuery, limit: int,
+        boundary: list[Any] | None, expected_revision: str | None,
+    ) -> dict[str, Any]:
+        partition, owner_params = source_partition(ctx)
+        limit = max(1, min(int(limit), 12))
+        conn, lock = self._read_connection_for_bundle()
+        with lock:
+            cutoff = time.monotonic() + 2.0
+            conn.set_progress_handler(lambda: int(time.monotonic() > cutoff), 2000)
+            try:
+                conn.execute("BEGIN")
+                revision_row = conn.execute("SELECT revision FROM source_query_revision WHERE singleton=1").fetchone()
+                revision = str(revision_row[0]) if revision_row else ""
+                if not revision or (expected_revision is not None and expected_revision != revision):
+                    raise SourceQueryError("cursor_invalid")
+                clauses = [partition]
+                if query.action != "read":
+                    clauses.append("julianday(t.occurred_at) IS NOT NULL")
+                params: list[Any] = list(owner_params)
+                if query.start_at:
+                    clauses.append("julianday(t.occurred_at)>=julianday(?)")
+                    params.append(query.start_at)
+                if query.end_at:
+                    clauses.append("julianday(t.occurred_at)<julianday(?)")
+                    params.append(query.end_at)
+                path = "time_range"
+                if query.terms:
+                    path = "partition_substring"
+                    if self._source_fts_enabled and all(len(term) >= 3 for term in query.terms):
+                        clauses.append("t.rowid IN (SELECT rowid FROM timeline_source_fts WHERE timeline_source_fts MATCH ?)")
+                        params.append(" OR ".join('"' + term.replace('"', '""') + '"' for term in query.terms))
+                        path = "fts5_trigram"
+                    clauses.append("(" + " OR ".join("instr(lower(t.content),lower(?))>0" for _ in query.terms) + ")")
+                    params.extend(query.terms)
+                where = " AND ".join(clauses)
+                order_columns = "julianday(t.occurred_at),t.created_at,t.id"
+                projection = "t.*,julianday(t.occurred_at) AS source_sort_time"
+                read_count = 0
+
+                def key(row: dict[str, Any]) -> list[Any]:
+                    return [row["source_sort_time"], row["created_at"], row["id"]]
+
+                def select(edge: list[Any] | None, *, ascending: bool, count: int) -> tuple[list[dict[str, Any]], bool]:
+                    nonlocal read_count
+                    edge_clause = ""
+                    edge_params: list[Any] = []
+                    if edge:
+                        edge_clause = f" AND ({order_columns}) {'>' if ascending else '<'} (?,?,?)"
+                        if query.action == "context":
+                            # The inclusive scalar bound enables the time index; the tuple remains exact.
+                            edge_clause = (
+                                f" AND julianday(t.occurred_at) {'>=' if ascending else '<='} ?"
+                                + edge_clause
+                            )
+                            edge_params.append(edge[0])
+                    sort = "ASC" if ascending else "DESC"
+                    order = ",".join(column + " " + sort for column in order_columns.split(","))
+                    found = [dict(row) for row in conn.execute(
+                        f"SELECT {projection} FROM timeline t WHERE {where}{edge_clause} ORDER BY {order} LIMIT ?",
+                        params + edge_params + (list(edge) if edge else []) + [count + 1],
+                    ).fetchall()]
+                    read_count += len(found)
+                    return found[:count], len(found) > count
+
+                continuations: dict[str, list[Any]] = {}
+                if query.action in {"context", "read"}:
+                    path = "source_" + query.action
+                    anchor = conn.execute(
+                        f"SELECT {projection} FROM timeline t WHERE {where} AND t.id=?",
+                        params + [query.source_ref[len("timeline:"):]],
+                    ).fetchone()
+                    if anchor is None:
+                        raise SourceQueryError("source_unavailable")
+                    read_count += 1
+                    anchor_key = key(dict(anchor))
+                    if query.action == "read":
+                        rows = [dict(anchor)]
+                    elif query.direction == "around":
+                        before_count = (limit - 1) // 2
+                        after_count = limit - 1 - before_count
+                        before, more_before = select(anchor_key, ascending=False, count=before_count)
+                        after, more_after = select(anchor_key, ascending=True, count=after_count)
+                        rows = [*reversed(before), dict(anchor), *after]
+                        if more_before:
+                            continuations["before"] = key(before[-1]) if before else anchor_key
+                        if more_after:
+                            continuations["after"] = key(after[-1]) if after else anchor_key
+                    else:
+                        ascending = query.direction == "after"
+                        rows, more = select(boundary or anchor_key, ascending=ascending, count=limit)
+                        if more and rows:
+                            continuations[query.direction] = key(rows[-1])
+                        if not ascending:
+                            rows.reverse()
+                else:
+                    rows, more = select(boundary, ascending=False, count=limit)
+                    if more and rows:
+                        continuations["next"] = key(rows[-1])
+                return {"rows": rows, "revision": revision, "continuations": continuations, "path": path, "read_count": read_count}
+            except sqlite3.OperationalError as exc:
+                if "interrupted" in str(exc):
+                    raise SourceQueryError("source_query_timeout") from exc
+                raise
+            finally:
+                conn.set_progress_handler(None, 0)
+                if conn.in_transaction:
+                    conn.rollback()
+
+    async def query_source_range_batch(
+        self, ctx: Any, *, start_at: str, end_at: str, limit: int,
+        boundary: list[Any] | None = None, expected_revision: str | None = None,
+    ) -> dict[str, Any]:
+        return await self._run_recoverable_database_operation(
+            self._query_source_range_batch_sync, ctx, start_at, end_at, limit, boundary, expected_revision,
+        )
+
+    def _query_source_range_batch_sync(
+        self, ctx: Any, start_at: str, end_at: str, limit: int,
+        boundary: list[Any] | None, expected_revision: str | None,
+    ) -> dict[str, Any]:
+        partition, params = source_partition(ctx)
+        limit = max(1, min(256, int(limit)))
+        conn, lock = self._read_connection_for_bundle()
+        with lock:
+            cutoff = time.monotonic() + 2.0
+            conn.set_progress_handler(lambda: int(time.monotonic() > cutoff), 2000)
+            try:
+                conn.execute("BEGIN")
+                revision_row = conn.execute("SELECT revision FROM source_query_revision WHERE singleton=1").fetchone()
+                revision = str(revision_row[0]) if revision_row else ""
+                if not revision or (expected_revision is not None and expected_revision != revision):
+                    raise SourceQueryError("cursor_invalid")
+                where = partition + " AND julianday(t.occurred_at)>=julianday(?) AND julianday(t.occurred_at)<julianday(?)"
+                params.extend([start_at, end_at])
+                if boundary is not None:
+                    # The cursor identifies the next unread row, including a partially delivered body.
+                    where += " AND julianday(t.occurred_at)>=? AND (julianday(t.occurred_at),t.created_at,t.id)>=(?,?,?)"
+                    params.extend([boundary[0], *boundary])
+                projection = (
+                    "t.id,t.event_type,t.scope,t.session_id,t.subject_id,t.object_id,t.occurred_at,t.created_at,"
+                    "CASE WHEN length(t.content)<=262144 THEN t.content ELSE NULL END AS content,"
+                    "CASE WHEN length(t.metadata)<=65536 THEN t.metadata ELSE NULL END AS metadata,"
+                    "length(t.content) AS source_content_chars,length(t.metadata) AS source_metadata_chars,"
+                    "julianday(t.occurred_at) AS source_sort_time"
+                )
+                rows = [dict(row) for row in conn.execute(
+                    f"SELECT {projection} FROM timeline t WHERE {where} "
+                    "ORDER BY julianday(t.occurred_at),t.created_at,t.id LIMIT ?", params + [limit + 1],
+                ).fetchall()]
+                lookahead = rows[limit] if len(rows) > limit else None
+                return {"rows": rows[:limit], "revision": revision, "read_count": len(rows),
+                        "eof": lookahead is None, "next_boundary": (
+                            [lookahead["source_sort_time"], lookahead["created_at"], lookahead["id"]]
+                            if lookahead is not None else None
+                        )}
+            except sqlite3.OperationalError as exc:
+                if "interrupted" in str(exc):
+                    raise SourceQueryError("source_query_timeout") from exc
+                raise
+            finally:
+                conn.set_progress_handler(None, 0)
+                if conn.in_transaction:
+                    conn.rollback()
 
     async def get_timeline_by_ids(self, event_ids: list[str]) -> dict[str, dict[str, Any]]:
         return await self._run_recoverable_database_operation(self._get_timeline_by_ids_sync, event_ids)
@@ -8644,6 +9013,7 @@ class MemoryStore(SummaryBatchStore):
         if scope:
             where += " AND scope=?"
             params.append(clean_text(scope, 40))
+        event_time_sql = _timeline_time_sql()
         with self._lock:
             cursor = None
             if clean_text(after_timeline_id, 160):
@@ -8652,10 +9022,14 @@ class MemoryStore(SummaryBatchStore):
                     (clean_text(after_timeline_id, 160), clean_text(session_id, 200)),
                 ).fetchone()
             if cursor:
-                where += " AND (occurred_at, created_at, id) > (?, ?, ?)"
+                where += (
+                    f" AND ({event_time_sql}, created_at, id) > "
+                    "(COALESCE(julianday(NULLIF(?, '')), julianday(NULLIF(?, '')), 0), ?, ?)"
+                )
                 params.extend(
                     [
                         clean_text(cursor["occurred_at"], 80),
+                        clean_text(cursor["created_at"], 80),
                         clean_text(cursor["created_at"], 80),
                         clean_text(cursor["id"], 160),
                     ]
@@ -8669,7 +9043,7 @@ class MemoryStore(SummaryBatchStore):
                 SELECT occurred_at
                 FROM timeline
                 WHERE {where}
-                ORDER BY occurred_at ASC, created_at ASC, id ASC
+                ORDER BY {event_time_sql} ASC, created_at ASC, id ASC
                 LIMIT 1
                 """,
                 params,
@@ -8679,7 +9053,7 @@ class MemoryStore(SummaryBatchStore):
                 SELECT *
                 FROM timeline
                 WHERE {where}
-                ORDER BY occurred_at ASC, created_at ASC, id ASC
+                ORDER BY {event_time_sql} ASC, created_at ASC, id ASC
                 LIMIT ?
                 """,
                 params + [max(1, int(limit))],
@@ -9992,12 +10366,16 @@ class MemoryStore(SummaryBatchStore):
         if requested_session:
             session_clause = " AND session_id=?"
             params.append(requested_session)
+        validity_clause, validity_params = validity_where_clause(valid_at=utc_now())
+        params.extend(validity_params)
         where = (
             "scope='private' AND review_status!='pending' "
             "AND visibility IN ('private_pair', 'shareable') "
-            f"AND ({identity_clause}){session_clause}"
+            f"AND ({identity_clause}){session_clause} "
+            f"AND lifecycle!='archived' AND {validity_clause}"
         )
         with self._lock:
+            revision = int(self._memory_revision_sync())
             rows = self._conn.execute(
                 f"""
                 SELECT * FROM memories
@@ -10015,6 +10393,10 @@ class MemoryStore(SummaryBatchStore):
                 f"SELECT memory_type, COUNT(*) AS count FROM memories WHERE {where} GROUP BY memory_type",
                 params,
             ).fetchall()
+            # Other MemoryStore instances may write through another connection.
+            # Do not pair old rows with a newer revision from a later read.
+            if int(self._memory_revision_sync()) != revision:
+                raise RuntimeError("memory_summary_snapshot_changed")
 
         records: list[MemoryRecord] = []
         for row in rows:
@@ -10035,6 +10417,7 @@ class MemoryStore(SummaryBatchStore):
             "records": records,
             "total": max(0, int(total_row["count"] or 0)) if total_row else 0,
             "type_counts": type_counts,
+            "memory_revision": revision,
         }
 
     @staticmethod
@@ -10878,6 +11261,63 @@ class MemoryStore(SummaryBatchStore):
                 self._upsert_memory_fts_row(refreshed)
                 return cur.rowcount > 0
 
+    async def correct_user_memory(self, ctx, *, action="correct", memory_id="", expected_version="",
+                                  correction_id="", content="", profile_value="", profile_polarity="", trace_id=""):
+        return await self._run_recoverable_database_operation(
+            self._correct_user_memory_sync, ctx, action, memory_id, expected_version,
+            correction_id, content, profile_value, profile_polarity, trace_id,
+        )
+
+    def _correct_user_memory_sync(self, ctx, action, memory_id, expected_version,
+                                 correction_id, content, profile_value, profile_polarity, trace_id):
+        if action not in {"correct", "lookup"} or not correction_id or len(correction_id) > 120:
+            raise MemoryRevisionError("invalid_correction_request")
+        scope_ref = correction_scope(ctx)
+        request_hash = digest([memory_id, expected_version, content, profile_value, profile_polarity, ctx.message_id, ctx.message_text])
+        with self._lock, self._transaction_sync():
+            existing = self._conn.execute(
+                "SELECT * FROM memory_correction_receipts WHERE scope_ref=? AND correction_id=?",
+                (scope_ref, correction_id),
+            ).fetchone()
+            if existing:
+                if action != "lookup" and existing["request_hash"] != request_hash:
+                    raise MemoryRevisionError("idempotency_conflict")
+                return {**json_loads(existing["receipt"], {}), "deduplicated": True}
+            if action == "lookup":
+                return {"ok": False, "reason_code": "correction_receipt_missing"}
+            row = self._conn.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
+            old = MemoryRecord.from_row(row) if row else None
+            if old is None or not correction_owner(ctx, old):
+                raise MemoryRevisionError("memory_not_owned")
+            if memory_ref(old)["version"] != expected_version or not current_memory(old):
+                raise MemoryRevisionError("memory_revision_conflict")
+            correction_ref = "correction:" + digest([scope_ref, correction_id])
+            replacement = revised_memory(
+                old, ctx, content=content, profile_value=profile_value,
+                profile_polarity=profile_polarity,
+                correction_ref=correction_ref, new_id="mem_" + digest([scope_ref, correction_id])[:32],
+            )
+            old_ref = memory_ref(old)
+            old.validity_status, old.lifecycle, old.updated_at = "superseded", "archived", utc_now()
+            old.metadata = {**old.metadata, "superseded_by": replacement.id, "correction_ref": correction_ref}
+            if old.memory_type in self.PROFILE_MEMORY_TYPES:
+                old.metadata.update(profile_state="superseded", profile_status="superseded")
+            self._write_memory_record_sync(old)
+            if self._profile_single_value_domain_conflict_sync(replacement):
+                raise MemoryRevisionError("profile_revision_conflict")
+            self._write_memory_record_sync(replacement)
+            receipt = {
+                "ok": True, "status": "succeeded", "effect_state": "committed", "deduplicated": False,
+                "correction_id": correction_id, "correction_ref": correction_ref, "trace_id": trace_id,
+                "old_ref": old_ref, "new_ref": memory_ref(replacement), "committed_at": replacement.created_at,
+                "source_message_id": ctx.message_id,
+            }
+            self._conn.execute(
+                "INSERT INTO memory_correction_receipts(scope_ref, correction_id, request_hash, receipt) VALUES(?,?,?,?)",
+                (scope_ref, correction_id, request_hash, json_dumps(receipt)),
+            )
+            return receipt
+
     async def update_memory_payload(
         self,
         memory_id: str,
@@ -11194,6 +11634,91 @@ class MemoryStore(SummaryBatchStore):
 
     async def delete_memory(self, memory_id: str) -> bool:
         return await asyncio.to_thread(self._delete_memory_sync, memory_id)
+
+    @staticmethod
+    def _timeline_ids_in_metadata(value: Any) -> set[str]:
+        refs: set[str] = set()
+        if isinstance(value, dict):
+            for item in value.values():
+                refs.update(MemoryStore._timeline_ids_in_metadata(item))
+        elif isinstance(value, (list, tuple, set)):
+            for item in value:
+                refs.update(MemoryStore._timeline_ids_in_metadata(item))
+        elif isinstance(value, str):
+            ref = value.strip()
+            if ref.startswith("timeline:"):
+                ref = ref[len("timeline:"):]
+            if ref.startswith("tl_") and len(ref) <= 160:
+                refs.add(ref)
+        return refs
+
+    def _timeline_reference_memories_sync(
+        self, event_ids: set[str]
+    ) -> list[tuple[str, dict[str, Any]]]:
+        if not event_ids:
+            return []
+        matches: list[tuple[str, dict[str, Any]]] = []
+        with self._lock:
+            rows = self._conn.execute("SELECT id, metadata FROM memories").fetchall()
+        for row in rows:
+            metadata = json_loads(row["metadata"], {})
+            if not isinstance(metadata, dict):
+                continue
+            if event_ids.intersection(self._timeline_ids_in_metadata(metadata)):
+                matches.append((clean_text(row["id"], 120), metadata))
+        return matches
+
+    def _mark_timeline_sources_expired_sync(self, event_ids: list[str]) -> int:
+        targets = {
+            clean_text(value, 160)
+            for value in event_ids
+            if clean_text(value, 160).startswith("tl_")
+        }
+        if not targets:
+            return 0
+        changed = 0
+        now = utc_now()
+        with self._lock:
+            for memory_id, metadata in self._timeline_reference_memories_sync(targets):
+                previous = metadata.get("source_expired_event_ids")
+                expired = [
+                    clean_text(value, 160)
+                    for value in previous
+                    if clean_text(value, 160)
+                ] if isinstance(previous, list) else []
+                matching = targets.intersection(self._timeline_ids_in_metadata(metadata))
+                merged = list(dict.fromkeys([*expired, *sorted(matching)]))
+                if merged == expired:
+                    continue
+                metadata["source_expired_event_ids"] = merged
+                self._conn.execute(
+                    "UPDATE memories SET metadata=?, updated_at=? WHERE id=?",
+                    (json_dumps(metadata), now, memory_id),
+                )
+                changed += 1
+        return changed
+
+    def _delete_memories_referencing_timeline_ids_sync(self, event_ids: list[str]) -> int:
+        targets = {
+            clean_text(value, 160)
+            for value in event_ids
+            if clean_text(value, 160).startswith("tl_")
+        }
+        if not targets:
+            return 0
+        with self._lock:
+            memory_ids = [
+                memory_id
+                for memory_id, _metadata in self._timeline_reference_memories_sync(targets)
+            ]
+            for memory_id in memory_ids:
+                self._conn.execute("DELETE FROM review_queue WHERE memory_id=?", (memory_id,))
+                self._conn.execute("DELETE FROM memory_embeddings WHERE memory_id=?", (memory_id,))
+                self._conn.execute("DELETE FROM relationship_edges WHERE source_memory_id=?", (memory_id,))
+                self._conn.execute("DELETE FROM knowledge_edges WHERE source_memory_id=?", (memory_id,))
+                self._delete_memory_fts_row(memory_id)
+                self._conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+        return len(memory_ids)
 
     def _delete_memory_sync(self, memory_id: str) -> bool:
         memory_id = clean_text(memory_id, 120)
@@ -11726,6 +12251,58 @@ class MemoryStore(SummaryBatchStore):
                     archived += int(cur.rowcount or 0)
         return archived
 
+    async def archive_expired_pending_candidates(self, cutoff_at: str, limit: int = 1000) -> int:
+        return await asyncio.to_thread(self._archive_expired_pending_candidates_sync, cutoff_at, limit)
+
+    def _archive_expired_pending_candidates_sync(self, cutoff_at: str, limit: int) -> int:
+        cutoff_at = clean_text(cutoff_at, 80)
+        if not cutoff_at:
+            return 0
+        now = utc_now()
+        with self._lock, self._transaction_sync():
+            rows = self._conn.execute(
+                """
+                SELECT id, metadata, tags, durability
+                FROM memories
+                WHERE lifecycle='short_term_candidate'
+                  AND review_status='pending'
+                  AND COALESCE(julianday(NULLIF(valid_to, '')), julianday(NULLIF(created_at, '')), 0) < julianday(?)
+                ORDER BY COALESCE(julianday(NULLIF(valid_to, '')), julianday(NULLIF(created_at, '')), 0) ASC
+                LIMIT ?
+                """,
+                (cutoff_at, max(1, int(limit or 1))),
+            ).fetchall()
+            archived = 0
+            for row in rows:
+                tags = json_loads(row["tags"], [])
+                tags = {clean_text(tag, 80).casefold() for tag in tags} if isinstance(tags, list) else set()
+                if row["durability"] == "pinned" or tags & {"manual", "protected", "keep", "no_decay"}:
+                    continue
+                metadata = json_loads(row["metadata"], {})
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                metadata["pending_review_archived"] = {
+                    "reason": "review_retention_expired",
+                    "cutoff_at": cutoff_at,
+                    "archived_at": now,
+                }
+                cur = self._conn.execute(
+                    """
+                    UPDATE memories
+                    SET lifecycle='archived', validity_status='archived', review_status='expired',
+                        metadata=?, updated_at=?
+                    WHERE id=? AND lifecycle='short_term_candidate' AND review_status='pending'
+                    """,
+                    (json_dumps(metadata), now, row["id"]),
+                )
+                if cur.rowcount:
+                    self._conn.execute(
+                        "UPDATE review_queue SET status='expired', updated_at=? WHERE memory_id=? AND status='pending'",
+                        (now, row["id"]),
+                    )
+                    archived += 1
+        return archived
+
     async def prune_retained_rows(
         self,
         *,
@@ -11791,14 +12368,15 @@ class MemoryStore(SummaryBatchStore):
                         FROM timeline
                         WHERE summarized_at!=''
                           AND retention_class!='historical_archive'
-                          AND COALESCE(NULLIF(occurred_at, ''), created_at) < ?
-                        ORDER BY COALESCE(NULLIF(occurred_at, ''), created_at) ASC
+                          AND COALESCE(julianday(NULLIF(occurred_at, '')),julianday(NULLIF(created_at, '')),0) < julianday(?)
+                        ORDER BY COALESCE(julianday(NULLIF(occurred_at, '')),julianday(NULLIF(created_at, '')),0) ASC
                         LIMIT ?
                         """,
                         (summarized_timeline_cutoff, safe_limit),
                     ).fetchall()
                     ids = [row["id"] for row in rows]
                     if ids:
+                        self._mark_timeline_sources_expired_sync(ids)
                         result: dict[str, int] = {}
                         self._delete_many_by_ids("timeline", "id", ids, result)
                         deleted["timeline"] = result.get("timeline", 0)
@@ -12058,6 +12636,18 @@ class MemoryStore(SummaryBatchStore):
                 ),
             )
             self._conn.commit()
+
+    async def search_memory_embeddings(self, **kwargs: Any) -> Any:
+        from .vector_search import search_embeddings_sync
+
+        cancelled = threading.Event()
+        try:
+            return await self._run_recoverable_database_operation(
+                lambda: search_embeddings_sync(self, **kwargs, cancelled=cancelled),
+            )
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
 
     async def list_embedding_candidate_rows(
         self,

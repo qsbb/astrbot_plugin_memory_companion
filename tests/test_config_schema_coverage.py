@@ -16,6 +16,10 @@ class ConfigSchemaCoverageTests(unittest.TestCase):
         schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
         expected = {
             "retrieval": {"embedding_index_pending"},
+            "source_semantic": {
+                "enabled", "provider_id", "model_revision", "dimensions",
+                "history_backfill_enabled", "sources_per_run", "provider_calls_per_run",
+            },
             "memory_injection": {"hook_request_budget_seconds", "injection_cache_ttl_seconds"},
             "visibility": {"hide_pending_review"},
             "maintenance_decay": {

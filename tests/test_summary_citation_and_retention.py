@@ -86,11 +86,11 @@ class CitationGateTests(unittest.TestCase):
 
     def test_unreferenced_fact_is_attributed_to_the_matching_message(self) -> None:
         summarizer = MemorySummarizer()
-        traced, warnings, errors = summarizer._normalize_key_facts(
+        traced, warnings, errors = summarizer._normalize_key_facts_with_validation(
             ["小王喜欢无糖拿铁"],
             [{"id": "event-1", "content": "小王喜欢无糖拿铁。"}],
         )
-        self.assertEqual([{"fact": "小王喜欢无糖拿铁", "refs": ["event-1"]}], traced)
+        self.assertEqual([{"fact": "小王喜欢无糖拿铁", "refs": ["event-1"], "evidence": [{"ref": "event-1", "quote": "小王喜欢无糖拿铁"}]}], traced)
         self.assertEqual([], errors)
 
 

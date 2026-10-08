@@ -24,7 +24,7 @@ from .profile_quality import PROFILE_MEMORY_TYPES, profile_quality_decision
 
 from .store import MemoryStore
 from .time_intent import TimeIntent
-from .visibility import VisibilityPolicy
+from .visibility import VisibilityPolicy, _platform_family
 
 
 class RetrievalEngine:
@@ -207,6 +207,7 @@ class RetrievalEngine:
         ctx: SessionContext,
         *,
         reason: str = "navigation_candidate",
+        include_core_memory: bool = False,
     ) -> tuple[list[SearchResult], list[dict[str, str]]]:
         """Apply the current visibility and ACL state to externally selected rows.
 
@@ -228,12 +229,8 @@ class RetrievalEngine:
             if is_memory_placeholder(memory):
                 blocked.append({"id": memory_id, "reason": "placeholder_memory", "content": ""})
                 continue
-            memory_platform = clean_text(getattr(memory, "platform", ""), 80).lower()
-            current_platform = clean_text(getattr(ctx, "platform", ""), 80).lower()
-            if memory_platform == "unknown":
-                memory_platform = ""
-            if current_platform == "unknown":
-                current_platform = ""
+            memory_platform = _platform_family(getattr(memory, "platform", ""))
+            current_platform = _platform_family(getattr(ctx, "platform", ""))
             if memory_platform and current_platform and memory_platform != current_platform:
                 blocked.append({"id": memory_id, "reason": "other_platform", "content": ""})
                 continue
@@ -247,7 +244,9 @@ class RetrievalEngine:
                     }
                 )
                 continue
-            visibility_reason, blocked_reason = self._search_visibility_reason(memory, ctx, acl_state)
+            visibility_reason, blocked_reason = self._search_visibility_reason(
+                memory, ctx, acl_state, include_core_memory=include_core_memory,
+            )
             if not visibility_reason:
                 blocked.append(
                     {
@@ -291,7 +290,9 @@ class RetrievalEngine:
             results = self._dedupe_by_content(results, self.dedupe_content_ratio)
         results = await self._mmr_diversify_async(results, max(1, int(top_k or 1)))
         selected = results[: max(1, int(top_k or 1))]
-        selected, mutable_blocked = self._collapse_mutable_fact_results(query, ctx, selected)
+        selected, mutable_blocked = self._collapse_mutable_fact_results(
+            query, ctx, selected, time_intent=time_intent
+        )
         blocked.extend(mutable_blocked)
         selected, source_blocked = self._collapse_redundant_source_results(selected)
         blocked.extend(source_blocked)
@@ -423,7 +424,9 @@ class RetrievalEngine:
                 selected.append(item)
                 selected_ids.add(item.memory.id)
 
-        selected, mutable_blocked, slot_map = self._collapse_mutable_fact_slots(query, ctx, selected, slot_map)
+        selected, mutable_blocked, slot_map = self._collapse_mutable_fact_slots(
+            query, ctx, selected, slot_map, time_intent=time_intent
+        )
         blocked.extend(mutable_blocked)
         selected, source_blocked, slot_map = self._collapse_redundant_source_slots(selected, slot_map)
         blocked.extend(source_blocked)
@@ -542,7 +545,9 @@ class RetrievalEngine:
                 "mode": self.retrieval_mode,
                 "path": "fallback_basic",
                 "provider_id": self.rerank_provider_id,
-                "reason": f"rerank_error:{clean_text(error, 160)}",
+                "reason": f"rerank_error:{type(error).__name__}:{clean_text(error, 160)}",
+                "rerank_error_type": type(error).__name__,
+                "rerank_timeout_ms": self.rerank_timeout_ms,
                 "candidate_count": len(ranked),
                 "rerank_pool": len(rerank_pool),
                 "rerank_filtered": filtered_count,
@@ -1059,8 +1064,12 @@ class RetrievalEngine:
         ctx: SessionContext,
         selected: list[SearchResult],
         slot_map: dict[str, list[SearchResult]],
+        *,
+        time_intent: TimeIntent | None = None,
     ) -> tuple[list[SearchResult], list[dict[str, str]], dict[str, list[SearchResult]]]:
-        collapsed, blocked = self._collapse_mutable_fact_results(query, ctx, selected)
+        collapsed, blocked = self._collapse_mutable_fact_results(
+            query, ctx, selected, time_intent=time_intent
+        )
         if not blocked:
             return selected, blocked, slot_map
         kept_ids = {item.memory.id for item in collapsed if item.memory.id}
@@ -1152,7 +1161,20 @@ class RetrievalEngine:
         query: str,
         ctx: SessionContext,
         results: list[SearchResult],
+        *,
+        time_intent: TimeIntent | None = None,
     ) -> tuple[list[SearchResult], list[dict[str, str]]]:
+        compact_query = re.sub(r"\s+", "", clean_text(query, 1000)).lower()
+        historical_anchor = any(
+            marker in compact_query
+            for marker in ("之前", "以前", "当时", "那时", "那时候", "那会儿", "去年", "前年", "当年", "曾经")
+        ) or bool(re.search(r"(?<!\d)(?:19|20)\d{2}(?:年|[-/.])", compact_query))
+        if (
+            (time_intent and time_intent.active)
+            or historical_anchor
+            or self._looks_like_contextual_recall_query(query)
+        ):
+            return results, []
         query_keys = self._mutable_fact_keys(query)
         if len(results) < 2 or not query_keys:
             return results, []
@@ -1411,14 +1433,18 @@ class RetrievalEngine:
                 ),
                 self._embedding_candidate_memories(
                     query,
+                    ctx,
                     include_pending=include_pending,
+                    time_intent=time_intent,
                 ),
             )
         except Exception:
             bundle = None
             vector_result = await self._embedding_candidate_memories(
                 query,
+                ctx,
                 include_pending=include_pending,
+                time_intent=time_intent,
             )
         if bundle is not None:
             bundle_timing = bundle.pop("_timing", None) or {}
@@ -1658,8 +1684,10 @@ class RetrievalEngine:
     async def _embedding_candidate_memories(
         self,
         query: str,
+        ctx: SessionContext,
         *,
         include_pending: bool,
+        time_intent: TimeIntent | None = None,
     ) -> tuple[list[MemoryRecord], dict[str, float], dict[str, Any]]:
         info: dict[str, Any] = {
             "embedding_enabled": bool(self.embedding_enabled),
@@ -1691,45 +1719,53 @@ class RetrievalEngine:
             info["embedding_reason"] = "empty_query_vector"
             return [], {}, info
 
-        try:
-            rows = await self.store.list_embedding_candidate_rows(
-                provider_id=self.embedding_provider_id,
-                limit=self.embedding_candidate_limit,
-                include_pending=include_pending,
-            )
-        except Exception as error:
-            info["embedding_reason"] = f"embedding_store_error:{clean_text(error, 120)}"
-            return [], {}, info
+        from .vector_search import VectorSnapshotChanged
 
-        scored: list[tuple[float, MemoryRecord]] = []
-        stale_count = 0
-        dimension_mismatch = 0
-        for memory, vector, text_hash in rows:
-            current_hash = self._embedding_text_hash(memory)
-            if current_hash and text_hash and current_hash != text_hash:
-                stale_count += 1
-                continue
-            if len(vector) != len(query_vector):
-                dimension_mismatch += 1
-                continue
-            similarity = self._cosine_similarity(query_vector, vector)
-            if similarity >= self.embedding_score_threshold:
-                scored.append((similarity, memory))
-
-        scored.sort(key=lambda item: item[0], reverse=True)
-        selected = scored[: self.embedding_top_k]
-        scores = {clean_text(memory.id, 120): float(score) for score, memory in selected if memory.id}
-        info.update(
-            {
-                "embedding_reason": "applied",
-                "embedding_candidates": len(rows),
-                "embedding_hits": len(selected),
-                "embedding_stale": stale_count,
-                "embedding_dim_mismatch": dimension_mismatch,
-                "embedding_threshold": self.embedding_score_threshold,
-            }
+        block_profile = self._query_blocks_profile_retrieval(query)
+        authorization_key = (
+            ctx.scope, ctx.session_id, ctx.platform, ctx.user_id, ctx.group_id,
+            ctx.bot_id, ctx.persona_id, ctx.strict_session_only,
+            self.policy.allow_self_timeline_everywhere, self.policy.allow_group_public_in_private,
+            self.policy.hide_pending_review, self.policy.include_raw_events,
+            self.policy.enable_acl_rules, self.policy.admin_read_all,
+            self.private_topology_enabled, self.group_topology_enabled, block_profile,
+            (time_intent.start_at, time_intent.end_at) if time_intent and time_intent.active else None,
         )
-        return [memory for _score, memory in selected], scores, info
+        # A data/ACL race retries once with current authorization and the same
+        # query vector. No second provider request, no importance-based fallback.
+        for attempt in range(2):
+            try:
+                revision = await self.store.memory_revision()
+                acl_state = await self._acl_state() if self.policy.enable_acl_rules else self._empty_acl_state()
+                selection_time = datetime.now(timezone.utc)
+
+                def eligible(memory: MemoryRecord) -> bool:
+                    visible, blocked = self._search_visibility_reason(memory, ctx, acl_state)
+                    return bool(
+                        visible and not blocked
+                        and evaluate_memory_lifecycle(memory, ctx, now=selection_time).eligible
+                        and not (block_profile and memory.memory_type in PROFILE_MEMORY_TYPES)
+                        and (not time_intent or not time_intent.active
+                             or self._memory_overlaps_time_window(memory, time_intent))
+                    )
+
+                memories, scores, diagnostics = await self.store.search_memory_embeddings(
+                    provider_id=self.embedding_provider_id, query=query_vector,
+                    expected_revision=revision, authorization_key=authorization_key, eligible=eligible,
+                    include_pending=include_pending, top_k=self.embedding_top_k,
+                    threshold=self.embedding_score_threshold, batch_size=self.embedding_candidate_limit,
+                    max_text_chars=self.embedding_max_text_chars, selection_time=selection_time.timestamp(),
+                )
+                info.update(diagnostics)
+                return memories, scores, info
+            except VectorSnapshotChanged:
+                if attempt == 0:
+                    continue
+                info["embedding_reason"] = "embedding_snapshot_changed"
+            except Exception as error:
+                info["embedding_reason"] = f"embedding_store_error:{clean_text(error, 120)}"
+                break
+        return [], {}, info
 
     @staticmethod
     def _is_embedding_provider(provider: Any) -> bool:
@@ -1912,10 +1948,10 @@ class RetrievalEngine:
     @staticmethod
     def _normalize_vector(vector: Any) -> list[float]:
         values = RetrievalEngine._coerce_vector(vector)
-        if not values:
+        if not values or not all(math.isfinite(value) for value in values):
             return []
-        norm = math.sqrt(sum(value * value for value in values))
-        if norm <= 0:
+        norm = math.hypot(*values)
+        if not math.isfinite(norm) or norm <= 0:
             return []
         return [value / norm for value in values]
 
@@ -2289,10 +2325,16 @@ class RetrievalEngine:
         memory: MemoryRecord,
         ctx: SessionContext,
         acl_state: dict[str, object],
+        *,
+        include_core_memory: bool = False,
     ) -> tuple[str, str]:
         if is_memory_placeholder(memory):
             return "", "placeholder_memory"
-        quality_allowed, quality_reason = self._profile_retrieval_decision(memory)
+        is_core = memory.memory_type == "core_memory" or (memory.metadata or {}).get("core_memory") is True
+        quality_allowed, quality_reason = (
+            (True, "static_core_memory") if include_core_memory and is_core
+            else self._profile_retrieval_decision(memory)
+        )
         if not quality_allowed:
             return "", quality_reason
         visible, visibility_reason = self.policy.is_visible(memory, ctx)

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 
@@ -388,14 +389,14 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
         await self.allow_private_to_group(service)
 
         service.identity.resolve_event_context = AsyncMock(return_value=self.group_context())
-        owner_result = await service.tool_recall(object(), "我中午吃了什么？")
+        owner_result = await service.tool_recall(SimpleNamespace(), "我中午吃了什么？")
         self.assertEqual(["小王明确说过：中午吃了番茄鸡蛋面。"], [item["content"] for item in owner_result["memories"]])
         self.assertIn("条件候选", owner_result["usage"])
 
         service.identity.resolve_event_context = AsyncMock(
             return_value=self.group_context(user_id="u2", message_text="小王中午吃了什么？")
         )
-        other_result = await service.tool_recall(object(), "小王中午吃了什么？")
+        other_result = await service.tool_recall(SimpleNamespace(), "小王中午吃了什么？")
         self.assertEqual([], other_result["memories"])
 
     async def test_recall_tool_keeps_other_memory_slots_when_schedules_rank_first(self) -> None:
@@ -464,7 +465,7 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
         )
         service.identity.resolve_event_context = AsyncMock(return_value=ctx)
 
-        result = await service.tool_recall(object(), "共同召回锚点", top_k=5)
+        result = await service.tool_recall(SimpleNamespace(), "共同召回锚点", top_k=5)
         memory_types = [item["memory_type"] for item in result["memories"]]
 
         self.assertIn("user_preference", memory_types)

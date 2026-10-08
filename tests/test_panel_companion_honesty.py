@@ -106,6 +106,7 @@ class CompanionLinkageHonestyTests(unittest.TestCase):
                 ["node", str(driver), str(PANEL_SCRIPT)],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 timeout=60,
             )
         self.assertNotEqual(

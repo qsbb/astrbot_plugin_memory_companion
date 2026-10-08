@@ -1157,6 +1157,32 @@ class MemoryCompanionBridge:
         producer_context: Any = None,
     ) -> dict[str, Any]:
         """Send one validated Bot Personal archive envelope without leaking failures."""
+        return await self._dispatch_bot_personal_archive(
+            "record_bot_personal_archive", envelope,
+            producer_capability=producer_capability, producer_context=producer_context,
+        )
+
+    async def lookup_bot_personal_archive(
+        self,
+        envelope: BotPersonalArchiveDTO | dict[str, Any],
+        *,
+        producer_capability: Any = None,
+        producer_context: Any = None,
+    ) -> dict[str, Any]:
+        """Read an archive receipt through the same producer/namespace boundary."""
+        return await self._dispatch_bot_personal_archive(
+            "lookup_bot_personal_archive", envelope,
+            producer_capability=producer_capability, producer_context=producer_context,
+        )
+
+    async def _dispatch_bot_personal_archive(
+        self,
+        method: str,
+        envelope: BotPersonalArchiveDTO | dict[str, Any],
+        *,
+        producer_capability: Any,
+        producer_context: Any,
+    ) -> dict[str, Any]:
         base = {
             "ok": False,
             "record_id": "",
@@ -1190,7 +1216,7 @@ class MemoryCompanionBridge:
             ):
                 return {**base, "state": "forbidden", "error_code": "producer_namespace_mismatch"}
         try:
-            recorder = getattr(self._plugin, "record_bot_personal_archive", None)
+            recorder = getattr(self._plugin, method, None)
         except Exception:
             recorder = None
         if not callable(recorder):
@@ -1400,6 +1426,11 @@ class MemoryCompanionBridge:
             "counts": counts,
             "summaries": summaries,
             "workspace": base["workspace"],
+            "memory_revision": (
+                result["memory_revision"]
+                if type(result.get("memory_revision")) is int and result["memory_revision"] >= 0
+                else None
+            ),
             **({"error_code": clean_text(result.get("error_code"), 80)} if state != "ready" and clean_text(result.get("error_code"), 80) else {}),
         }
 
@@ -1632,6 +1663,131 @@ class MemoryCompanionBridge:
             p5_attestation=p5_attestation,
             p5_attestation_consumer=p5_attestation_consumer,
         )
+
+    async def correct_user_memory(self, *, event: Any, **kwargs: Any) -> dict[str, Any]:
+        return await self._plugin.correct_user_memory(event=event, **kwargs)
+
+    async def check_memory_dependencies(self, *, event: Any, refs: list[dict[str, str]]) -> dict[str, Any]:
+        return await self._plugin.check_memory_dependencies(event=event, refs=refs)
+
+    async def open_role_input_sources(self, *, event, producer_capability, context, identity):
+        """Explicit original-role assembly; does not enable a production writer."""
+        if not self._is_valid_private_companion_capability(producer_capability):
+            raise ValueError("memory_role_producer_unavailable")
+        from .role_input_sources import RoleInputSources
+        owner = getattr(self._plugin, "_role_input_sources", None)
+        if owner is None:
+            owner = RoleInputSources(self._plugin)
+            self._plugin._role_input_sources = owner
+        return await owner.open(self, event, producer_capability, context, identity)
+
+    async def open_role_task_sources(self, *, task_ticket, producer_capability):
+        """Pull the live task grant from the registered producer, not caller JSON."""
+        if not self._is_valid_private_companion_capability(producer_capability):
+            raise ValueError('memory_role_producer_unavailable')
+        producer = self._producer_capability_from(producer_capability)._producer
+        runtime = getattr(producer, '_s4_work_runtime', None)
+        manager = getattr(runtime, 'role_tasks', None)
+        if manager is None or runtime.plugin is not producer:
+            raise ValueError('memory_role_task_producer_unavailable')
+        from .role_input_sources import RoleInputSources
+        owner = getattr(self._plugin, '_role_input_sources', None)
+        if owner is None:
+            owner = RoleInputSources(self._plugin)
+            self._plugin._role_input_sources = owner
+        return await owner.open_task(self, producer_capability, manager, task_ticket)
+
+    async def bind_life_sources(self, *, event, refs, binding, producer_capability=None):
+        if not self._is_valid_private_companion_capability(producer_capability):
+            return {"status": "unavailable", "items": []}
+        from .source_watches import bind
+        result = await bind(self._plugin, event, refs, binding)
+        return result if self._is_valid_private_companion_capability(producer_capability) else {"status": "unavailable", "items": []}
+
+    def check_life_sources(self, *, binding, tickets, producer_capability=None):
+        if not self._is_valid_private_companion_capability(producer_capability):
+            return {"status": "unavailable", "items": []}
+        from .source_watches import check
+        return check(self._plugin, binding, tickets)
+
+    async def source_capture_permission(self, *, event, producer_capability=None):
+        if not self._is_valid_private_companion_capability(producer_capability):
+            return False
+        capture = getattr(self._plugin, "capture", None)
+        if capture is None:
+            return False
+        ctx = self._plugin._normalized_session_context(await self._plugin.identity.resolve_event_context(event))
+        identity = capture.identity(ctx, direction="incoming", message="permission")
+        setattr(event,'_s4_memory_source_context',{key:identity[key] for key in ('platform','bot','persona','scope','session','audience')})
+        return capture.allowed(identity) and self._is_valid_private_companion_capability(producer_capability)
+
+    async def accept_source_withdrawal(self, *, ticket, producer_capability=None):
+        if not self._is_valid_private_companion_capability(producer_capability): return {'status':'unavailable'}
+        producer=self._producer_capability_from(producer_capability)._producer
+        work=getattr(producer,'_s4_work_runtime',None)
+        delivery=getattr(work,'delivery',None); capture=getattr(self._plugin,'capture',None)
+        if delivery is None or capture is None: return {'status':'unavailable'}
+        notice=delivery.export_notice(ticket)
+        if not notice: return {'status':'unavailable'}
+        if delivery.row(ticket) and not delivery.bind_memory(ticket,capture.store.installation):
+            return {'status':'held','reason':'memory_owner_changed'}
+        import json
+        from .source_capture import digest
+        context=json.loads(notice['context'])
+        if set(context)!={'platform','bot','persona','scope','session','audience'}: return {'status':'held','reason':'capture_scope_unbound'}
+        identity=dict(context,installation=capture.store.installation,speaker=context['audience'],
+                      direction='incoming',message=notice['native_id'])
+        # This contains no text, and remains a cleanup request after capture is disabled.
+        return capture.store.withdraw(digest(identity),reason='native_friend_recall')
+
+    async def accept_source_delivery(self, *, ticket, producer_capability=None):
+        """Pull a part from the registered Delivery owner, never from caller text."""
+        if not self._is_valid_private_companion_capability(producer_capability):
+            return {"status": "unavailable"}
+        producer = self._producer_capability_from(producer_capability)._producer
+        work = getattr(producer, "_s4_work_runtime", None)
+        delivery = getattr(work, "delivery", None)
+        capture = getattr(self._plugin, "capture", None)
+        if delivery is None or capture is None:
+            return {"status": "unavailable"}
+        exported = delivery.export(ticket)
+        if not exported:
+            return {"status": "excluded"}
+        row, scope, payload = exported
+        if not delivery.bind_memory(ticket, capture.store.installation):
+            return {"status": "held", "reason": "memory_owner_changed"}
+        context=payload.get('memory_context',{})
+        if set(context)!={'platform','bot','persona','scope','session','audience'}:
+            return {'status':'held','reason':'capture_scope_unbound'}
+        if context['persona']!=scope.persona_id or context['scope']!='private':
+            return {'status':'held','reason':'capture_scope_mismatch'}
+        identity=dict(context,installation=capture.store.installation,
+                      speaker=context['audience'] if row['direction']=='incoming' else context['bot'],
+                      direction=row['direction'],message=row['native_id'] if row['direction']=='incoming' else 'delivery:'+ticket)
+        authorize = lambda: (self._is_valid_private_companion_capability(producer_capability)
+                             and work.allowed(scope) and delivery.export(ticket) is not None)
+        return capture.submit(identity, dict(body=payload["body"], media=payload["media"],
+                              source_message_at=payload.get("source_message_at", ""), observed_at=payload["observed_at"],
+                              evidence=row["evidence"], raw_body_digest=payload.get("raw_body_digest", "")), authorize=authorize)
+
+    async def bind_life_message_sources(self, *, event, binding, producer_capability=None):
+        if not self._is_valid_private_companion_capability(producer_capability):
+            return {"status": "unavailable", "items": []}
+        from .message_sources import bind
+        result = await bind(self._plugin, event, binding)
+        return result if self._is_valid_private_companion_capability(producer_capability) else {"status": "unavailable", "items": []}
+
+    def check_life_message_sources(self, *, binding, tickets, producer_capability=None):
+        if not self._is_valid_private_companion_capability(producer_capability):
+            return {"status": "unavailable", "items": []}
+        from .message_sources import check
+        return check(self._plugin, binding, tickets)
+
+    async def manage_life_message_source(self, *, event, producer_capability=None, **request):
+        if not self._is_valid_private_companion_capability(producer_capability):
+            return {"status": "unavailable", "ok": False}
+        from .message_sources import manage
+        return await manage(self._plugin, event, authorize=lambda: self._is_valid_private_companion_capability(producer_capability), **request)
 
     async def remember(self, *, event: Any, content: str, note_type: str = "memory") -> dict[str, Any]:
         return await self._plugin.tool_remember(event, content, note_type=note_type)
@@ -2129,6 +2285,8 @@ class MemoryCompanionBridge:
                 "compose_context",
                 "remember",
                 "recall",
+                "correct_user_memory",
+                "check_memory_dependencies",
                 "consume_person_projection",
                 "consume_context_projection",
                 "consume_relationship_projection",
@@ -2584,6 +2742,7 @@ class MemoryCompanionBridge:
         )
 
 def serialize_memory(record: MemoryRecord, score: float | None = None, reason: str = "") -> dict[str, Any]:
+    from .memory_revision import memory_ref
     metadata = record.metadata if isinstance(record.metadata, dict) else {}
     key_facts = metadata.get("key_facts") if isinstance(metadata.get("key_facts"), list) else []
     key_facts_with_refs = (
@@ -2616,6 +2775,7 @@ def serialize_memory(record: MemoryRecord, score: float | None = None, reason: s
     }
     data = {
         "id": record.id,
+        "memory_ref": memory_ref(record),
         "memory_type": record.memory_type,
         "scope": record.scope,
         "session_id": record.session_id,
@@ -2648,6 +2808,22 @@ def serialize_memory(record: MemoryRecord, score: float | None = None, reason: s
                     for ref in item.get("refs", [])
                     if clean_text(ref, 160)
                 ][:6],
+                **(
+                    {
+                        "evidence": [
+                            {
+                                "ref": clean_text(source.get("ref") or source.get("event_id"), 160),
+                                "quote": clean_text(source.get("quote"), 220),
+                            }
+                            for source in item.get("evidence", [])
+                            if isinstance(source, dict)
+                            and clean_text(source.get("ref") or source.get("event_id"), 160)
+                            and clean_text(source.get("quote"), 220)
+                        ][:6]
+                    }
+                    if isinstance(item.get("evidence"), list) and item.get("evidence")
+                    else {}
+                ),
             }
             for item in key_facts_with_refs
             if isinstance(item, dict) and clean_text(item.get("fact"), 180)

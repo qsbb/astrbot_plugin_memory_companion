@@ -125,6 +125,15 @@ class MemoryAtomV2Tests(unittest.TestCase):
         )
         self.assertEqual(1, store._conn.execute("SELECT COUNT(*) FROM memories WHERE id='kept'").fetchone()[0])
 
+    def test_atom_backfill_is_not_repeated_after_schema_migration(self) -> None:
+        store = self.make_store()
+        store._insert_memory_sync(self.record("kept"))
+
+        with patch.object(store, "_backfill_memory_atom_v2_sync") as backfill:
+            store.initialize()
+
+        backfill.assert_not_called()
+
     def test_clear_all_covers_bridge_portrait_emotion_and_namespace_tables(self) -> None:
         store = self.make_store()
         result = store._clear_all_memory_data_sync()
@@ -448,6 +457,9 @@ class MemoryAtomV2Tests(unittest.TestCase):
                SET content='api_key=legacy-plain-secret',
                    metadata='{"weather_api_key":"legacy-meta-secret"}'
                WHERE id='legacy-secret'"""
+        )
+        store._conn.execute(
+            "UPDATE schema_metadata SET value='' WHERE key='sensitive_redaction_version'"
         )
         raw = store._conn.execute(
             "SELECT * FROM memories WHERE id='legacy-secret'"
