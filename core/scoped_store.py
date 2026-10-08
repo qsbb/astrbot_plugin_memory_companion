@@ -86,6 +86,7 @@ class ScopedStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._clock = clock if callable(clock) else time.time
         self._lock = threading.RLock()
+        self._local = threading.local()
         self._active_epoch = ""
         self._active_policy_version = ""
         self._epoch_revision = 0
@@ -101,17 +102,41 @@ class ScopedStore:
         conn.execute("PRAGMA secure_delete=ON")
         return conn
 
+    def _thread_connection(self) -> sqlite3.Connection:
+        """Return a reusable per-thread connection for short-lived reads.
+
+        Opening a connection replays every PRAGMA, which measures at roughly
+        0.09 ms, and a full scoped projection sweep issues thousands of short
+        reads. Reusing one connection per thread removes that fixed cost while
+        keeping sqlite3's default single-thread affinity (connections are not
+        shared between threads).
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = self._connect()
+            self._local.conn = conn
+        return conn
+
+    def close(self) -> None:
+        """Close this thread's cached read connection, if one was opened."""
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+            self._local.conn = None
+
     def _truncate_wal(self) -> None:
         with self._connection() as conn:
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        conn = self._connect()
-        try:
-            yield conn
-        finally:
-            conn.close()
+        # Read path: reuse the per-thread connection. Writes keep taking a
+        # fresh connection through ``_transaction`` so every write retains its
+        # own BEGIN IMMEDIATE / COMMIT isolation.
+        yield self._thread_connection()
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:

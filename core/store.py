@@ -3201,7 +3201,42 @@ class MemoryStore(SummaryBatchStore):
             self._conn.commit()
             with closing(sqlite3.connect(str(target))) as target_conn:
                 self._conn.backup(target_conn)
+        self._prune_old_backups()
         return target
+
+    def _prune_old_backups(self, keep: int = 2) -> list[Path]:
+        """Delete older rotation backups so they cannot grow without bound.
+
+        ``backup()`` previously never cleaned up after itself. On a production
+        sized store every copy is hundreds of megabytes, and stale copies from
+        schema upgrades or maintenance runs had accumulated to several
+        gigabytes. Keep the newest few and remove the rest.
+        """
+        try:
+            kept = max(1, int(keep))
+        except (TypeError, ValueError):
+            kept = 2
+        removed: list[Path] = []
+        try:
+            candidates = sorted(
+                self.db_path.parent.glob(f"{self.db_path.stem}.backup.*.db"),
+                key=lambda item: item.name,
+                reverse=True,
+            )
+        except OSError:
+            return removed
+        for stale in candidates[kept:]:
+            try:
+                stale.unlink()
+            except OSError:
+                continue
+            removed.append(stale)
+            for sidecar in (f"{stale}-wal", f"{stale}-shm"):
+                try:
+                    Path(sidecar).unlink()
+                except OSError:
+                    pass
+        return removed
 
     async def backup_async(self, suffix: str = "") -> Path:
         """Copy the whole database without blocking the event loop.

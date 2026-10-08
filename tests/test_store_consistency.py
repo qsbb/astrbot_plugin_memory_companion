@@ -91,6 +91,45 @@ class StoreConsistencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(3000, store._conn.execute("PRAGMA busy_timeout").fetchone()[0])
         self.assertEqual(500, store._conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0])
 
+    async def test_backup_prunes_older_rotation_copies(self) -> None:
+        """Rotation backups must not accumulate without bound."""
+        store = self.make_store()
+        directory = store.db_path.parent
+        stem = store.db_path.stem
+        stale = []
+        for stamp in (
+            "20260101T000000_0000",
+            "20260301T000000_0000",
+            "20260601T000000_0000",
+        ):
+            path = directory / f"{stem}.backup.{stamp}.before_test.db"
+            path.write_bytes(b"stale")
+            stale.append(path)
+
+        created = store.backup(".before_test")
+
+        self.assertTrue(created.exists())
+        remaining = sorted(directory.glob(f"{stem}.backup.*.db"))
+        self.assertLessEqual(len(remaining), 2)
+        # The newest stale copy is kept as the second rollback point; older ones go.
+        self.assertFalse(stale[0].exists())
+        self.assertFalse(stale[1].exists())
+        self.assertTrue(stale[2].exists())
+
+    async def test_backup_prune_keeps_newest_copies(self) -> None:
+        store = self.make_store()
+        directory = store.db_path.parent
+        stem = store.db_path.stem
+        first = directory / f"{stem}.backup.20260101T000000_0000.a.db"
+        second = directory / f"{stem}.backup.20260201T000000_0000.b.db"
+        first.write_bytes(b"old")
+        second.write_bytes(b"new")
+
+        store._prune_old_backups(keep=1)
+
+        self.assertFalse(first.exists())
+        self.assertTrue(second.exists())
+
     async def test_wal_checkpoint_truncate_skips_below_threshold(self) -> None:
         store = self.make_store()
         # A fresh empty DB has a tiny (or absent) WAL, so a high threshold skips.
